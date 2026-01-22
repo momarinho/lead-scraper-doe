@@ -4,19 +4,34 @@ import asyncio
 import logging
 import re
 import urllib.parse
-from typing import List, Optional
+from typing import List, Optional, Dict
 from bs4 import BeautifulSoup
 from datetime import datetime
 
 from src.domain.schemas import LeadScraperDirective, ScrapeSource
+from src.utils.resilience import CircuitBreaker, CircuitBreakerOpenError
+
 
 class SourceExecutor(ABC):
-    """Base class for source-specific executors"""
-    
+    """Base class for source-specific executors with circuit breaker support"""
+
+    # Class-level circuit breakers (shared across instances per source)
+    _circuit_breakers: Dict[str, CircuitBreaker] = {}
+
     def __init__(self, session: aiohttp.ClientSession, directive: LeadScraperDirective):
         self.session = session
         self.directive = directive
         self.logger = logging.getLogger(self.__class__.__name__)
+
+        # Initialize circuit breaker for this source if not exists
+        source_name = self.__class__.__name__
+        if source_name not in self._circuit_breakers:
+            self._circuit_breakers[source_name] = CircuitBreaker(
+                service_name=source_name,
+                failure_threshold=5,
+                timeout=60.0
+            )
+        self.circuit_breaker = self._circuit_breakers[source_name]
 
     @abstractmethod
     async def execute(self) -> List[dict]:
@@ -24,14 +39,18 @@ class SourceExecutor(ABC):
         pass
 
     async def _fetch_page(self, url: str) -> str:
-        """Fetch page with anti-bot handling"""
+        """Fetch page with anti-bot handling and circuit breaker protection"""
+        return await self.circuit_breaker.call(self._fetch_page_internal, url)
+
+    async def _fetch_page_internal(self, url: str) -> str:
+        """Internal fetch method (called through circuit breaker)"""
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
         }
-        
+
         if self.directive.anti_bot:
             await asyncio.sleep(2)  # Rate limiting
-        
+
         async with self.session.get(
             url,
             headers=headers,
@@ -39,6 +58,10 @@ class SourceExecutor(ABC):
         ) as resp:
             resp.raise_for_status()
             return await resp.text()
+
+    def get_circuit_status(self) -> dict:
+        """Get circuit breaker status for monitoring"""
+        return self.circuit_breaker.get_status()
 
 
 class GoogleMapsExecutor(SourceExecutor):
@@ -291,21 +314,35 @@ class YellowPagesExecutor(SourceExecutor):
     - Can be extended for other regional directories
     """
 
+    # Brazilian state abbreviations for URL building
+    BRAZIL_STATES = {
+        "rio de janeiro": "rj", "são paulo": "sp", "sao paulo": "sp",
+        "minas gerais": "mg", "bahia": "ba", "paraná": "pr", "parana": "pr",
+        "rio grande do sul": "rs", "pernambuco": "pe", "ceará": "ce", "ceara": "ce",
+        "pará": "pa", "para": "pa", "santa catarina": "sc", "goiás": "go", "goias": "go",
+        "maranhão": "ma", "maranhao": "ma", "amazonas": "am", "espírito santo": "es",
+        "espirito santo": "es", "paraíba": "pb", "paraiba": "pb", "mato grosso": "mt",
+        "rio grande do norte": "rn", "alagoas": "al", "piauí": "pi", "piaui": "pi",
+        "distrito federal": "df", "brasília": "df", "brasilia": "df",
+        "mato grosso do sul": "ms", "sergipe": "se", "rondônia": "ro", "rondonia": "ro",
+        "tocantins": "to", "acre": "ac", "amapá": "ap", "amapa": "ap", "roraima": "rr",
+    }
+
     # Site configurations for different Yellow Pages platforms
     SITE_CONFIGS = {
         "brazil": {
-            "base_url": "https://www.telelistas.net",
-            "search_path": "/busca/{location}/{query}",
+            "base_url": "https://www.buscja.com",
+            "search_path": "/{state}/{city}/{query}/",
             "selectors": {
-                "results_container": "div.listagem-empresas, div.search-results, main",
-                "result_item": "div.empresa-item, div.business-card, article.listing",
-                "name": "h2.nome-empresa, h3.business-name, .company-name",
-                "phone": "span.telefone, a[href^='tel:'], .phone-number",
-                "address": "span.endereco, address, .address",
-                "category": "span.categoria, .business-category, .category",
-                "website": "a.website, a[rel='nofollow'][href^='http']",
+                "results_container": "body",  # Search entire document
+                "result_item": "div.card.mt-2",
+                "name": "h5.card-title",
+                "phone": "button.ver-tel",  # data-telefone attribute
+                "address": "p.card-text.text-muted",
+                "category": ".categoria, span.badge",
+                "website": "button.vai-site",  # data-site attribute
             },
-            "pagination": "a.proxima-pagina, a.next, .pagination a:last-child"
+            "pagination": "a[href*='pag=']"
         },
         "us": {
             "base_url": "https://www.yellowpages.com",
@@ -392,25 +429,76 @@ class YellowPagesExecutor(SourceExecutor):
     def _build_search_url(self, page: int = 1) -> str:
         """Build the search URL for the configured Yellow Pages site"""
         config = self.site_config
+        is_brazil = config["base_url"] == "https://www.buscja.com"
 
-        # URL-encode the search terms
-        query = urllib.parse.quote(self.directive.search_query)
-        location = urllib.parse.quote(self.directive.location or "Brazil")
+        if is_brazil:
+            # Brazilian URL format: /{state}/{city}/{query}/
+            location = (self.directive.location or "").lower()
 
-        # Build path from template
-        path = config["search_path"].format(
-            query=query,
-            location=location
-        )
+            # Extract state from location
+            state = self._extract_brazil_state(location)
 
-        url = f"{config['base_url']}{path}"
+            # Format city (lowercase, spaces to +)
+            city = self._extract_city(location)
+            city_formatted = city.lower().replace(" ", "+")
 
-        # Add pagination if not first page
-        if page > 1:
-            separator = "&" if "?" in url else "?"
-            url = f"{url}{separator}page={page}"
+            # Format query (lowercase, spaces to +)
+            query = self.directive.search_query.lower().replace(" ", "+")
+
+            path = f"/{state}/{city_formatted}/{query}/"
+            url = f"{config['base_url']}{path}"
+
+            # Add pagination using buscja.com format
+            if page > 1:
+                url = f"{url}?pag={page}"
+        else:
+            # US/other format: standard query string
+            query = urllib.parse.quote(self.directive.search_query)
+            location = urllib.parse.quote(self.directive.location or "")
+
+            path = config["search_path"].format(
+                query=query,
+                location=location
+            )
+            url = f"{config['base_url']}{path}"
+
+            if page > 1:
+                separator = "&" if "?" in url else "?"
+                url = f"{url}{separator}page={page}"
 
         return url
+
+    def _extract_brazil_state(self, location: str) -> str:
+        """Extract state abbreviation from location string"""
+        location_lower = location.lower()
+
+        # Check direct mapping
+        for name, abbrev in self.BRAZIL_STATES.items():
+            if name in location_lower:
+                return abbrev
+
+        # Check for state abbreviation at end (e.g., "Rio de Janeiro, RJ")
+        parts = location.split(",")
+        if len(parts) > 1:
+            potential_state = parts[-1].strip().lower()
+            if len(potential_state) == 2 and potential_state in self.BRAZIL_STATES.values():
+                return potential_state
+
+        # Default to RJ if no match
+        return "rj"
+
+    def _extract_city(self, location: str) -> str:
+        """Extract city name from location string"""
+        # Remove state suffix if present
+        parts = location.split(",")
+        city = parts[0].strip()
+
+        # Remove common suffixes
+        for suffix in [" brazil", " brasil", " - rj", " - sp"]:
+            if city.lower().endswith(suffix):
+                city = city[:-len(suffix)]
+
+        return city.strip()
 
     def _parse_results(self, html: str, source_url: str) -> List[dict]:
         """Parse HTML and extract lead data"""
@@ -453,6 +541,8 @@ class YellowPagesExecutor(SourceExecutor):
 
     def _extract_lead_from_item(self, item, selectors: dict, source_url: str) -> Optional[dict]:
         """Extract lead data from a single result item"""
+        is_brazil = "buscja.com" in source_url
+
         lead = {
             "source_platform": "yellow_pages",
             "source_url": source_url,
@@ -469,8 +559,10 @@ class YellowPagesExecutor(SourceExecutor):
         # Extract phone
         phone_el = self._select_first(item, selectors["phone"])
         if phone_el:
-            # Check if it's a tel: link
-            if phone_el.name == "a" and phone_el.get("href", "").startswith("tel:"):
+            if is_brazil and phone_el.get("data-telefone"):
+                # Brazilian site uses data-telefone attribute
+                lead["phone"] = phone_el["data-telefone"]
+            elif phone_el.name == "a" and phone_el.get("href", "").startswith("tel:"):
                 lead["phone"] = phone_el["href"].replace("tel:", "").strip()
             else:
                 lead["phone"] = self._clean_phone(phone_el.get_text(strip=True))
@@ -478,7 +570,11 @@ class YellowPagesExecutor(SourceExecutor):
         # Extract address
         address_el = self._select_first(item, selectors["address"])
         if address_el:
-            lead["address"] = address_el.get_text(strip=True)
+            # Clean up the address text
+            address_text = address_el.get_text(separator=" ", strip=True)
+            # Remove extra whitespace and special characters
+            address_text = " ".join(address_text.split())
+            lead["address"] = address_text
 
         # Extract category/niche
         category_el = self._select_first(item, selectors["category"])
@@ -487,11 +583,15 @@ class YellowPagesExecutor(SourceExecutor):
 
         # Extract website
         website_el = self._select_first(item, selectors["website"])
-        if website_el and website_el.get("href"):
-            href = website_el["href"]
-            # Filter out internal links
-            if href.startswith("http") and "yellowpages" not in href and "telelistas" not in href:
-                lead["website"] = href
+        if website_el:
+            if is_brazil and website_el.get("data-site"):
+                # Brazilian site uses data-site attribute
+                lead["website"] = website_el["data-site"]
+            elif website_el.get("href"):
+                href = website_el["href"]
+                # Filter out internal links
+                if href.startswith("http") and "yellowpages" not in href and "buscja" not in href:
+                    lead["website"] = href
 
         return lead
 
