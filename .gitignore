@@ -27,11 +27,10 @@ env/
 .venv/
 
 # IDE
-.idea/
 .vscode/
+.idea/
 *.swp
 *.swo
-*~
 
 # OS
 .DS_Store
@@ -39,22 +38,7 @@ Thumbs.db
 
 # Logs
 *.log
-logs/
 
-# Environment variables
+# Local config
 .env
 .env.local
-.env.*.local
-
-# Modal
-.modal/
-
-# Test outputs
-output/
-*.csv
-*.json
-!package.json
-
-# Playwright
-playwright-report/
-test-results/
